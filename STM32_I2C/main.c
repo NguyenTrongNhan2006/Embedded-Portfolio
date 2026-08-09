@@ -10,26 +10,16 @@
 #define MPU6050_ADDR 0x68u
 
 /* =========================================================
- * MPU6050 REGISTERS
+ * MPU6050 REGISTER
  * ========================================================= */
 
 #define MPU_PWR_MGMT_1 0x6Bu
 #define MPU_WHO_AM_I 0x75u
-
 #define MPU_ACCEL_X_H 0x3Bu
 #define MPU_ACCEL_X_L 0x3Cu
 
 /* =========================================================
  * LCD PCF8574
- *
- * P0 -> RS
- * P1 -> RW
- * P2 -> EN
- * P3 -> Backlight
- * P4 -> D4
- * P5 -> D5
- * P6 -> D6
- * P7 -> D7
  * ========================================================= */
 
 #define LCD_RS 0x01u
@@ -41,9 +31,10 @@
  * ========================================================= */
 
 #define UART_BAUDRATE 115200u
+#define UART_RX_BUFFER_SIZE 64u
 
 /* =========================================================
- * AX STREAM PERIOD
+ * AX
  * ========================================================= */
 
 #define AX_UPDATE_PERIOD_MS 500u
@@ -52,19 +43,25 @@
  * GLOBAL VARIABLES
  * ========================================================= */
 
-/*
- * SysTick tăng mỗi 1 ms.
- */
 static volatile uint32_t g_ms = 0u;
 
-/*
- * = 0: không stream AX
- * = 1: stream AX liên tục
- */
-static uint8_t g_ax_stream = 0u;
+/* AX stream */
+static volatile uint8_t g_ax_stream = 0u;
+
+/* Báo main rằng STOP vừa được bắt bởi UART IRQ */
+static volatile uint8_t g_stop_event = 0u;
+
+/* State machine nhận S -> T -> O -> P */
+static volatile uint8_t g_stop_state = 0u;
+
+/* UART RX Ring Buffer */
+static volatile char uart_rx_buffer[UART_RX_BUFFER_SIZE];
+
+static volatile uint8_t uart_rx_head = 0u;
+static volatile uint8_t uart_rx_tail = 0u;
 
 /* =========================================================
- * SYSTICK INTERRUPT
+ * SYSTICK IRQ
  * ========================================================= */
 
 void SysTick_Handler(void)
@@ -82,9 +79,6 @@ static uint32_t Get_PCLK1(void)
 
     SystemCoreClockUpdate();
 
-    /*
-     * PPRE1 nằm ở CFGR[10:8]
-     */
     ppre1 = (RCC->CFGR >> 8) & 0x07u;
 
     if (ppre1 < 4u)
@@ -116,9 +110,6 @@ static uint32_t Get_PCLK2(void)
 
     SystemCoreClockUpdate();
 
-    /*
-     * PPRE2 nằm ở CFGR[13:11]
-     */
     ppre2 = (RCC->CFGR >> 11) & 0x07u;
 
     if (ppre2 < 4u)
@@ -146,9 +137,6 @@ static uint32_t Get_PCLK2(void)
 
 /* =========================================================
  * DELAY
- *
- * Chỉ dùng cho LCD init / timing đơn giản.
- * Không dùng để tạo AX stream.
  * ========================================================= */
 
 static void Delay_ms(uint32_t ms)
@@ -176,7 +164,6 @@ static void Delay_ms(uint32_t ms)
  *
  * PA9  = TX
  * PA10 = RX
- * 115200 baud
  * ========================================================= */
 
 static void UART1_Init(void)
@@ -189,10 +176,10 @@ static void UART1_Init(void)
     /* USART1 clock */
     RCC->APB2ENR |= RCC_APB2ENR_USART1EN;
 
-    /* -----------------------------------------------------
-     * PA9 = USART1_TX
-     * Alternate Function Push-Pull
-     * ----------------------------------------------------- */
+    /* =====================================================
+     * PA9 = TX
+     * Alternate Function Push Pull
+     * ===================================================== */
 
     GPIOA->CRH &=
         ~(GPIO_CRH_MODE9 |
@@ -202,10 +189,10 @@ static void UART1_Init(void)
         GPIO_CRH_MODE9 |
         GPIO_CRH_CNF9_1;
 
-    /* -----------------------------------------------------
-     * PA10 = USART1_RX
+    /* =====================================================
+     * PA10 = RX
      * Floating Input
-     * ----------------------------------------------------- */
+     * ===================================================== */
 
     GPIOA->CRH &=
         ~(GPIO_CRH_MODE10 |
@@ -214,23 +201,48 @@ static void UART1_Init(void)
     GPIOA->CRH |=
         GPIO_CRH_CNF10_0;
 
-    /* -----------------------------------------------------
+    /* =====================================================
      * Baudrate
-     * ----------------------------------------------------- */
+     * ===================================================== */
 
     pclk2 = Get_PCLK2();
 
     USART1->BRR =
         (pclk2 + (UART_BAUDRATE / 2u)) / UART_BAUDRATE;
 
-    /* TX + RX */
+    /* =====================================================
+     * Enable:
+     *
+     * TX
+     * RX
+     * RX Interrupt
+     * ===================================================== */
+
     USART1->CR1 =
         USART_CR1_TE |
-        USART_CR1_RE;
+        USART_CR1_RE |
+        USART_CR1_RXNEIE;
 
-    /* Enable USART1 */
+    /* Enable USART */
     USART1->CR1 |= USART_CR1_UE;
+
+    /* =====================================================
+     * NVIC
+     *
+     * UART RX interrupt ưu tiên cao
+     * ===================================================== */
+
+    NVIC_SetPriority(
+        USART1_IRQn,
+        0u);
+
+    NVIC_EnableIRQ(
+        USART1_IRQn);
 }
+
+/* =========================================================
+ * UART SEND CHAR
+ * ========================================================= */
 
 static void UART1_SendChar(char c)
 {
@@ -241,6 +253,10 @@ static void UART1_SendChar(char c)
     USART1->DR = (uint8_t)c;
 }
 
+/* =========================================================
+ * UART SEND STRING
+ * ========================================================= */
+
 static void UART1_SendString(const char *str)
 {
     while (*str != '\0')
@@ -250,6 +266,10 @@ static void UART1_SendString(const char *str)
         str++;
     }
 }
+
+/* =========================================================
+ * UART HEX
+ * ========================================================= */
 
 static void UART1_PrintHex8(uint8_t value)
 {
@@ -262,6 +282,10 @@ static void UART1_PrintHex8(uint8_t value)
     UART1_SendChar(
         hex[value & 0x0Fu]);
 }
+
+/* =========================================================
+ * UART INTEGER
+ * ========================================================= */
 
 static void UART1_PrintInt(int16_t value)
 {
@@ -289,11 +313,9 @@ static void UART1_PrintInt(int16_t value)
 
     while (number > 0)
     {
-        buffer[index] =
+        buffer[index++] =
             (char)('0' +
                    (number % 10));
-
-        index++;
 
         number /= 10;
     }
@@ -308,26 +330,223 @@ static void UART1_PrintInt(int16_t value)
 }
 
 /* =========================================================
+ * UART RX INTERRUPT
+ *
+ * CỰC KỲ QUAN TRỌNG
+ *
+ * STOP được nhận ngay tại interrupt.
+ *
+ * Không cần ENTER.
+ * ========================================================= */
+
+void USART1_IRQHandler(void)
+{
+    char c;
+    uint8_t next;
+
+    /* =====================================================
+     * RXNE
+     * ===================================================== */
+
+    if ((USART1->SR & USART_SR_RXNE) != 0u)
+    {
+        /*
+         * Đọc DR
+         * -> RXNE được clear.
+         */
+        c =
+            (char)(USART1->DR &
+                   0xFFu);
+
+        /* =================================================
+         * lowercase -> uppercase
+         * ================================================= */
+
+        if ((c >= 'a') &&
+            (c <= 'z'))
+        {
+            c =
+                (char)(c - 'a' + 'A');
+        }
+
+        /* =================================================
+         * STOP STATE MACHINE
+         *
+         * S -> T -> O -> P
+         *
+         * Không cần ENTER.
+         * ================================================= */
+
+        switch (g_stop_state)
+        {
+            /* =============================================
+             * Wait S
+             * ============================================= */
+
+        case 0u:
+        {
+            if (c == 'S')
+            {
+                g_stop_state = 1u;
+            }
+
+            break;
+        }
+
+            /* =============================================
+             * Wait T
+             * ============================================= */
+
+        case 1u:
+        {
+            if (c == 'T')
+            {
+                g_stop_state = 2u;
+            }
+            else if (c == 'S')
+            {
+                g_stop_state = 1u;
+            }
+            else
+            {
+                g_stop_state = 0u;
+            }
+
+            break;
+        }
+
+            /* =============================================
+             * Wait O
+             * ============================================= */
+
+        case 2u:
+        {
+            if (c == 'O')
+            {
+                g_stop_state = 3u;
+            }
+            else if (c == 'S')
+            {
+                g_stop_state = 1u;
+            }
+            else
+            {
+                g_stop_state = 0u;
+            }
+
+            break;
+        }
+
+            /* =============================================
+             * Wait P
+             * ============================================= */
+
+        case 3u:
+        {
+            if (c == 'P')
+            {
+                /*
+                 * =========================
+                 * STOP AX NGAY
+                 * =========================
+                 */
+
+                g_ax_stream = 0u;
+
+                /*
+                 * Báo main
+                 */
+                g_stop_event = 1u;
+
+                /*
+                 * Reset detector
+                 */
+                g_stop_state = 0u;
+            }
+            else if (c == 'S')
+            {
+                g_stop_state = 1u;
+            }
+            else
+            {
+                g_stop_state = 0u;
+            }
+
+            break;
+        }
+
+        default:
+        {
+            g_stop_state = 0u;
+
+            break;
+        }
+        }
+
+        /* =================================================
+         * STORE RX DATA
+         *
+         * HELP
+         * AX
+         * SCAN
+         * MPU
+         * LCD HELLO
+         * ================================================= */
+
+        next =
+            (uint8_t)((uart_rx_head + 1u) %
+                      UART_RX_BUFFER_SIZE);
+
+        if (next != uart_rx_tail)
+        {
+            uart_rx_buffer[uart_rx_head] = c;
+
+            uart_rx_head = next;
+        }
+    }
+}
+
+/* =========================================================
+ * READ CHAR FROM RX BUFFER
+ *
+ * NON-BLOCKING
+ * ========================================================= */
+
+static uint8_t UART1_ReadChar(char *c)
+{
+    if (uart_rx_head ==
+        uart_rx_tail)
+    {
+        return 0u;
+    }
+
+    *c =
+        uart_rx_buffer[uart_rx_tail];
+
+    uart_rx_tail =
+        (uint8_t)((uart_rx_tail + 1u) %
+                  UART_RX_BUFFER_SIZE);
+
+    return 1u;
+}
+
+/* =========================================================
  * I2C GPIO
- *
- * I2C1:
- * PB6  = SCL
- * PB7  = SDA
- *
- * I2C2:
- * PB10 = SCL
- * PB11 = SDA
  * ========================================================= */
 
 static void I2C_GPIO_Init(void)
 {
-    RCC->APB2ENR |= RCC_APB2ENR_IOPBEN;
+    RCC->APB2ENR |=
+        RCC_APB2ENR_IOPBEN;
 
-    /* -----------------------------------------------------
-     * PB6 / PB7
+    /* =====================================================
      * I2C1
-     * Alternate Function Open Drain
-     * ----------------------------------------------------- */
+     *
+     * PB6 = SCL
+     * PB7 = SDA
+     *
+     * AF Open Drain
+     * ===================================================== */
 
     GPIOB->CRL &=
         ~(GPIO_CRL_MODE6 |
@@ -341,11 +560,14 @@ static void I2C_GPIO_Init(void)
         GPIO_CRL_MODE7 |
         GPIO_CRL_CNF7;
 
-    /* -----------------------------------------------------
-     * PB10 / PB11
+    /* =====================================================
      * I2C2
-     * Alternate Function Open Drain
-     * ----------------------------------------------------- */
+     *
+     * PB10 = SCL
+     * PB11 = SDA
+     *
+     * AF Open Drain
+     * ===================================================== */
 
     GPIOB->CRH &=
         ~(GPIO_CRH_MODE10 |
@@ -361,9 +583,9 @@ static void I2C_GPIO_Init(void)
 }
 
 /* =========================================================
- * GENERIC I2C CONFIG
+ * I2C CONFIG
  *
- * Standard Mode = 100 kHz
+ * 100 kHz
  * ========================================================= */
 
 static void I2C_Config(I2C_TypeDef *I2Cx)
@@ -375,19 +597,12 @@ static void I2C_Config(I2C_TypeDef *I2Cx)
     pclk1 = Get_PCLK1();
 
     freq_mhz =
-        pclk1 / 1000000u;
+        pclk1 /
+        1000000u;
 
-    /*
-     * Peripheral clock MHz
-     */
-    I2Cx->CR2 = freq_mhz;
+    I2Cx->CR2 =
+        freq_mhz;
 
-    /*
-     * Standard Mode:
-     *
-     * CCR =
-     * PCLK1 / (2 * 100 kHz)
-     */
     ccr =
         pclk1 /
         (2u * 100000u);
@@ -397,67 +612,61 @@ static void I2C_Config(I2C_TypeDef *I2Cx)
         ccr = 4u;
     }
 
-    I2Cx->CCR = ccr;
+    I2Cx->CCR =
+        ccr;
 
-    /*
-     * Standard mode:
-     *
-     * TRISE = FREQ + 1
-     */
     I2Cx->TRISE =
         freq_mhz + 1u;
 
-    /*
-     * ACK enable
-     */
-    I2Cx->CR1 |= I2C_CR1_ACK;
+    /* ACK default */
+    I2Cx->CR1 |=
+        I2C_CR1_ACK;
 
-    /*
-     * Enable peripheral
-     */
-    I2Cx->CR1 |= I2C_CR1_PE;
+    /* Enable */
+    I2Cx->CR1 |=
+        I2C_CR1_PE;
 }
+
+/* =========================================================
+ * I2C1 INIT
+ * ========================================================= */
 
 static void I2C1_Init(void)
 {
     RCC->APB1ENR |=
         RCC_APB1ENR_I2C1EN;
 
-    /*
-     * Reset I2C1
-     */
     RCC->APB1RSTR |=
         RCC_APB1RSTR_I2C1RST;
 
     RCC->APB1RSTR &=
         ~RCC_APB1RSTR_I2C1RST;
 
-    I2C_Config(I2C1);
+    I2C_Config(
+        I2C1);
 }
+
+/* =========================================================
+ * I2C2 INIT
+ * ========================================================= */
 
 static void I2C2_Init(void)
 {
     RCC->APB1ENR |=
         RCC_APB1ENR_I2C2EN;
 
-    /*
-     * Reset I2C2
-     */
     RCC->APB1RSTR |=
         RCC_APB1RSTR_I2C2RST;
 
     RCC->APB1RSTR &=
         ~RCC_APB1RSTR_I2C2RST;
 
-    I2C_Config(I2C2);
+    I2C_Config(
+        I2C2);
 }
 
 /* =========================================================
- * CHECK I2C ADDRESS
- *
- * return:
- * 1 = ACK
- * 0 = NACK / timeout
+ * CHECK ADDRESS
  * ========================================================= */
 
 static uint8_t I2C_CheckAddress(
@@ -466,58 +675,53 @@ static uint8_t I2C_CheckAddress(
 {
     uint32_t timeout;
 
-    I2Cx->SR1 &= ~I2C_SR1_AF;
+    I2Cx->SR1 &=
+        ~I2C_SR1_AF;
 
-    /*
-     * START
-     */
-    I2Cx->CR1 |= I2C_CR1_START;
+    /* START */
+    I2Cx->CR1 |=
+        I2C_CR1_START;
 
-    timeout = 100000u;
+    timeout =
+        100000u;
 
-    while ((I2Cx->SR1 & I2C_SR1_SB) == 0u)
+    while ((I2Cx->SR1 &
+            I2C_SR1_SB) == 0u)
     {
         if (--timeout == 0u)
         {
-            I2Cx->CR1 |= I2C_CR1_STOP;
+            I2Cx->CR1 |=
+                I2C_CR1_STOP;
 
             return 0u;
         }
     }
 
-    /*
-     * Address + WRITE
-     */
+    /* Address Write */
     I2Cx->DR =
         (uint8_t)(address << 1);
 
-    timeout = 100000u;
+    timeout =
+        100000u;
 
     while (timeout > 0u)
     {
-        /*
-         * ACK
-         */
-        if ((I2Cx->SR1 & I2C_SR1_ADDR) != 0u)
+        /* ACK */
+        if ((I2Cx->SR1 &
+             I2C_SR1_ADDR) != 0u)
         {
-            /*
-             * Clear ADDR
-             */
             (void)I2Cx->SR1;
             (void)I2Cx->SR2;
 
-            /*
-             * STOP
-             */
-            I2Cx->CR1 |= I2C_CR1_STOP;
+            I2Cx->CR1 |=
+                I2C_CR1_STOP;
 
             return 1u;
         }
 
-        /*
-         * NACK
-         */
-        if ((I2Cx->SR1 & I2C_SR1_AF) != 0u)
+        /* NACK */
+        if ((I2Cx->SR1 &
+             I2C_SR1_AF) != 0u)
         {
             I2Cx->SR1 &=
                 ~I2C_SR1_AF;
@@ -531,37 +735,34 @@ static uint8_t I2C_CheckAddress(
         timeout--;
     }
 
-    I2Cx->CR1 |= I2C_CR1_STOP;
+    I2Cx->CR1 |=
+        I2C_CR1_STOP;
 
     return 0u;
 }
 
 /* =========================================================
- * SCAN I2C BUS
+ * I2C SCANNER
  * ========================================================= */
 
 static void I2C_Scan(
     I2C_TypeDef *I2Cx,
-    const char *bus_name)
+    const char *name)
 {
     uint8_t address;
-
     uint8_t found = 0u;
 
     UART1_SendString(
-        "\r\n============================\r\n");
+        "\r\n------------------------\r\n");
 
     UART1_SendString(
         "Scanning ");
 
     UART1_SendString(
-        bus_name);
+        name);
 
     UART1_SendString(
         "\r\n");
-
-    UART1_SendString(
-        "============================\r\n");
 
     for (address = 0x08u;
          address <= 0x77u;
@@ -572,7 +773,7 @@ static void I2C_Scan(
                 address) != 0u)
         {
             UART1_SendString(
-                "Found device: 0x");
+                "Found: 0x");
 
             UART1_PrintHex8(
                 address);
@@ -587,7 +788,7 @@ static void I2C_Scan(
     if (found == 0u)
     {
         UART1_SendString(
-            "No I2C device found\r\n");
+            "No device found\r\n");
     }
 
     UART1_SendString(
@@ -595,9 +796,9 @@ static void I2C_Scan(
 }
 
 /* =========================================================
- * I2C WRITE ONE BYTE
+ * I2C WRITE BYTE
  *
- * Used by LCD PCF8574
+ * LCD PCF8574
  * ========================================================= */
 
 static uint8_t I2C_WriteByte(
@@ -607,14 +808,15 @@ static uint8_t I2C_WriteByte(
 {
     uint32_t timeout;
 
-    /*
-     * START
-     */
-    I2Cx->CR1 |= I2C_CR1_START;
+    /* START */
+    I2Cx->CR1 |=
+        I2C_CR1_START;
 
-    timeout = 100000u;
+    timeout =
+        100000u;
 
-    while ((I2Cx->SR1 & I2C_SR1_SB) == 0u)
+    while ((I2Cx->SR1 &
+            I2C_SR1_SB) == 0u)
     {
         if (--timeout == 0u)
         {
@@ -622,17 +824,18 @@ static uint8_t I2C_WriteByte(
         }
     }
 
-    /*
-     * Address + WRITE
-     */
+    /* Address write */
     I2Cx->DR =
         (uint8_t)(address << 1);
 
-    timeout = 100000u;
+    timeout =
+        100000u;
 
-    while ((I2Cx->SR1 & I2C_SR1_ADDR) == 0u)
+    while ((I2Cx->SR1 &
+            I2C_SR1_ADDR) == 0u)
     {
-        if ((I2Cx->SR1 & I2C_SR1_AF) != 0u)
+        if ((I2Cx->SR1 &
+             I2C_SR1_AF) != 0u)
         {
             I2Cx->SR1 &=
                 ~I2C_SR1_AF;
@@ -652,18 +855,16 @@ static uint8_t I2C_WriteByte(
         }
     }
 
-    /*
-     * Clear ADDR
-     */
+    /* Clear ADDR */
     (void)I2Cx->SR1;
     (void)I2Cx->SR2;
 
-    /*
-     * Wait TXE
-     */
-    timeout = 100000u;
+    /* TXE */
+    timeout =
+        100000u;
 
-    while ((I2Cx->SR1 & I2C_SR1_TXE) == 0u)
+    while ((I2Cx->SR1 &
+            I2C_SR1_TXE) == 0u)
     {
         if (--timeout == 0u)
         {
@@ -671,17 +872,15 @@ static uint8_t I2C_WriteByte(
         }
     }
 
-    /*
-     * Send data
-     */
-    I2Cx->DR = data;
+    I2Cx->DR =
+        data;
 
-    /*
-     * Wait BTF
-     */
-    timeout = 100000u;
+    /* BTF */
+    timeout =
+        100000u;
 
-    while ((I2Cx->SR1 & I2C_SR1_BTF) == 0u)
+    while ((I2Cx->SR1 &
+            I2C_SR1_BTF) == 0u)
     {
         if (--timeout == 0u)
         {
@@ -689,18 +888,14 @@ static uint8_t I2C_WriteByte(
         }
     }
 
-    /*
-     * STOP
-     */
-    I2Cx->CR1 |= I2C_CR1_STOP;
+    I2Cx->CR1 |=
+        I2C_CR1_STOP;
 
     return 1u;
 }
 
 /* =========================================================
  * I2C WRITE REGISTER
- *
- * Used by MPU6050
  * ========================================================= */
 
 static uint8_t I2C_WriteRegister(
@@ -712,11 +907,14 @@ static uint8_t I2C_WriteRegister(
     uint32_t timeout;
 
     /* START */
-    I2Cx->CR1 |= I2C_CR1_START;
+    I2Cx->CR1 |=
+        I2C_CR1_START;
 
-    timeout = 100000u;
+    timeout =
+        100000u;
 
-    while ((I2Cx->SR1 & I2C_SR1_SB) == 0u)
+    while ((I2Cx->SR1 &
+            I2C_SR1_SB) == 0u)
     {
         if (--timeout == 0u)
         {
@@ -724,15 +922,18 @@ static uint8_t I2C_WriteRegister(
         }
     }
 
-    /* Address + WRITE */
+    /* ADDRESS WRITE */
     I2Cx->DR =
         (uint8_t)(address << 1);
 
-    timeout = 100000u;
+    timeout =
+        100000u;
 
-    while ((I2Cx->SR1 & I2C_SR1_ADDR) == 0u)
+    while ((I2Cx->SR1 &
+            I2C_SR1_ADDR) == 0u)
     {
-        if ((I2Cx->SR1 & I2C_SR1_AF) != 0u)
+        if ((I2Cx->SR1 &
+             I2C_SR1_AF) != 0u)
         {
             I2Cx->SR1 &=
                 ~I2C_SR1_AF;
@@ -749,18 +950,16 @@ static uint8_t I2C_WriteRegister(
         }
     }
 
-    /*
-     * Clear ADDR
-     */
+    /* Clear ADDR */
     (void)I2Cx->SR1;
     (void)I2Cx->SR2;
 
-    /*
-     * Send register
-     */
-    timeout = 100000u;
+    /* Register */
+    timeout =
+        100000u;
 
-    while ((I2Cx->SR1 & I2C_SR1_TXE) == 0u)
+    while ((I2Cx->SR1 &
+            I2C_SR1_TXE) == 0u)
     {
         if (--timeout == 0u)
         {
@@ -768,14 +967,15 @@ static uint8_t I2C_WriteRegister(
         }
     }
 
-    I2Cx->DR = reg;
+    I2Cx->DR =
+        reg;
 
-    /*
-     * Send data
-     */
-    timeout = 100000u;
+    /* Data */
+    timeout =
+        100000u;
 
-    while ((I2Cx->SR1 & I2C_SR1_TXE) == 0u)
+    while ((I2Cx->SR1 &
+            I2C_SR1_TXE) == 0u)
     {
         if (--timeout == 0u)
         {
@@ -783,14 +983,15 @@ static uint8_t I2C_WriteRegister(
         }
     }
 
-    I2Cx->DR = data;
+    I2Cx->DR =
+        data;
 
-    /*
-     * Wait BTF
-     */
-    timeout = 100000u;
+    /* BTF */
+    timeout =
+        100000u;
 
-    while ((I2Cx->SR1 & I2C_SR1_BTF) == 0u)
+    while ((I2Cx->SR1 &
+            I2C_SR1_BTF) == 0u)
     {
         if (--timeout == 0u)
         {
@@ -798,16 +999,14 @@ static uint8_t I2C_WriteRegister(
         }
     }
 
-    /*
-     * STOP
-     */
-    I2Cx->CR1 |= I2C_CR1_STOP;
+    I2Cx->CR1 |=
+        I2C_CR1_STOP;
 
     return 1u;
 }
 
 /* =========================================================
- * I2C READ 1 REGISTER
+ * I2C READ REGISTER
  * ========================================================= */
 
 static uint8_t I2C_ReadRegister(
@@ -823,11 +1022,14 @@ static uint8_t I2C_ReadRegister(
      * START
      * ===================================================== */
 
-    I2Cx->CR1 |= I2C_CR1_START;
+    I2Cx->CR1 |=
+        I2C_CR1_START;
 
-    timeout = 100000u;
+    timeout =
+        100000u;
 
-    while ((I2Cx->SR1 & I2C_SR1_SB) == 0u)
+    while ((I2Cx->SR1 &
+            I2C_SR1_SB) == 0u)
     {
         if (--timeout == 0u)
         {
@@ -842,9 +1044,11 @@ static uint8_t I2C_ReadRegister(
     I2Cx->DR =
         (uint8_t)(address << 1);
 
-    timeout = 100000u;
+    timeout =
+        100000u;
 
-    while ((I2Cx->SR1 & I2C_SR1_ADDR) == 0u)
+    while ((I2Cx->SR1 &
+            I2C_SR1_ADDR) == 0u)
     {
         if (--timeout == 0u)
         {
@@ -852,19 +1056,18 @@ static uint8_t I2C_ReadRegister(
         }
     }
 
-    /*
-     * Clear ADDR
-     */
     (void)I2Cx->SR1;
     (void)I2Cx->SR2;
 
     /* =====================================================
-     * SEND REGISTER
+     * REGISTER
      * ===================================================== */
 
-    timeout = 100000u;
+    timeout =
+        100000u;
 
-    while ((I2Cx->SR1 & I2C_SR1_TXE) == 0u)
+    while ((I2Cx->SR1 &
+            I2C_SR1_TXE) == 0u)
     {
         if (--timeout == 0u)
         {
@@ -872,11 +1075,14 @@ static uint8_t I2C_ReadRegister(
         }
     }
 
-    I2Cx->DR = reg;
+    I2Cx->DR =
+        reg;
 
-    timeout = 100000u;
+    timeout =
+        100000u;
 
-    while ((I2Cx->SR1 & I2C_SR1_BTF) == 0u)
+    while ((I2Cx->SR1 &
+            I2C_SR1_BTF) == 0u)
     {
         if (--timeout == 0u)
         {
@@ -888,11 +1094,14 @@ static uint8_t I2C_ReadRegister(
      * REPEATED START
      * ===================================================== */
 
-    I2Cx->CR1 |= I2C_CR1_START;
+    I2Cx->CR1 |=
+        I2C_CR1_START;
 
-    timeout = 100000u;
+    timeout =
+        100000u;
 
-    while ((I2Cx->SR1 & I2C_SR1_SB) == 0u)
+    while ((I2Cx->SR1 &
+            I2C_SR1_SB) == 0u)
     {
         if (--timeout == 0u)
         {
@@ -908,9 +1117,11 @@ static uint8_t I2C_ReadRegister(
         (uint8_t)((address << 1) |
                   1u);
 
-    timeout = 100000u;
+    timeout =
+        100000u;
 
-    while ((I2Cx->SR1 & I2C_SR1_ADDR) == 0u)
+    while ((I2Cx->SR1 &
+            I2C_SR1_ADDR) == 0u)
     {
         if (--timeout == 0u)
         {
@@ -919,34 +1130,30 @@ static uint8_t I2C_ReadRegister(
     }
 
     /*
-     * Single-byte receive
-     *
-     * Disable ACK trước khi
-     * clear ADDR.
+     * Single byte:
+     * disable ACK BEFORE clear ADDR
      */
-    I2Cx->CR1 &= ~I2C_CR1_ACK;
+    I2Cx->CR1 &=
+        ~I2C_CR1_ACK;
 
-    /*
-     * Clear ADDR
-     */
     (void)I2Cx->SR1;
     (void)I2Cx->SR2;
 
-    /*
-     * STOP
-     */
-    I2Cx->CR1 |= I2C_CR1_STOP;
+    /* STOP */
+    I2Cx->CR1 |=
+        I2C_CR1_STOP;
 
-    /*
-     * Wait RXNE
-     */
-    timeout = 100000u;
+    /* RXNE */
+    timeout =
+        100000u;
 
-    while ((I2Cx->SR1 & I2C_SR1_RXNE) == 0u)
+    while ((I2Cx->SR1 &
+            I2C_SR1_RXNE) == 0u)
     {
         if (--timeout == 0u)
         {
-            I2Cx->CR1 |= I2C_CR1_ACK;
+            I2Cx->CR1 |=
+                I2C_CR1_ACK;
 
             return 0u;
         }
@@ -956,21 +1163,20 @@ static uint8_t I2C_ReadRegister(
         (uint8_t)I2Cx->DR;
 
     /*
-     * Enable ACK lại
+     * ACK back on
      */
-    I2Cx->CR1 |= I2C_CR1_ACK;
+    I2Cx->CR1 |=
+        I2C_CR1_ACK;
 
     return data;
 }
 
 /* =========================================================
- * LCD1602
- *
- * I2C1
- * PB6 / PB7
+ * LCD
  * ========================================================= */
 
-static void LCD_ExpanderWrite(uint8_t data)
+static void LCD_ExpanderWrite(
+    uint8_t data)
 {
     (void)I2C_WriteByte(
         I2C1,
@@ -979,7 +1185,8 @@ static void LCD_ExpanderWrite(uint8_t data)
                   LCD_BACKLIGHT));
 }
 
-static void LCD_PulseEnable(uint8_t data)
+static void LCD_PulseEnable(
+    uint8_t data)
 {
     LCD_ExpanderWrite(
         (uint8_t)(data |
@@ -1006,35 +1213,42 @@ static void LCD_WriteNibble(
 
     if (rs != 0u)
     {
-        data |= LCD_RS;
+        data |=
+            LCD_RS;
     }
 
-    LCD_ExpanderWrite(data);
+    LCD_ExpanderWrite(
+        data);
 
-    LCD_PulseEnable(data);
+    LCD_PulseEnable(
+        data);
 }
 
-static void LCD_Command(uint8_t command)
+static void LCD_Command(
+    uint8_t command)
 {
     LCD_WriteNibble(
         (uint8_t)(command >> 4),
         0u);
 
     LCD_WriteNibble(
-        (uint8_t)(command & 0x0Fu),
+        (uint8_t)(command &
+                  0x0Fu),
         0u);
 
     Delay_ms(2u);
 }
 
-static void LCD_Data(uint8_t data)
+static void LCD_Data(
+    uint8_t data)
 {
     LCD_WriteNibble(
         (uint8_t)(data >> 4),
         1u);
 
     LCD_WriteNibble(
-        (uint8_t)(data & 0x0Fu),
+        (uint8_t)(data &
+                  0x0Fu),
         1u);
 
     Delay_ms(1u);
@@ -1042,14 +1256,8 @@ static void LCD_Data(uint8_t data)
 
 static void LCD_Init(void)
 {
-    /*
-     * LCD power-up
-     */
     Delay_ms(50u);
 
-    /*
-     * HD44780 init sequence
-     */
     LCD_WriteNibble(
         0x03u,
         0u);
@@ -1069,46 +1277,50 @@ static void LCD_Init(void)
     Delay_ms(5u);
 
     /*
-     * 4-bit mode
+     * 4 bit mode
      */
     LCD_WriteNibble(
         0x02u,
         0u);
 
     /*
-     * 4-bit
-     * 2 lines
-     * 5x8 font
+     * 4 bit
+     * 2 line
      */
-    LCD_Command(0x28u);
+    LCD_Command(
+        0x28u);
 
     /*
      * Display OFF
      */
-    LCD_Command(0x08u);
+    LCD_Command(
+        0x08u);
 
     /*
      * Clear
      */
-    LCD_Command(0x01u);
+    LCD_Command(
+        0x01u);
 
     Delay_ms(5u);
 
     /*
-     * Entry Mode
+     * Entry mode
      */
-    LCD_Command(0x06u);
+    LCD_Command(
+        0x06u);
 
     /*
      * Display ON
-     * Cursor OFF
      */
-    LCD_Command(0x0Cu);
+    LCD_Command(
+        0x0Cu);
 }
 
 static void LCD_Clear(void)
 {
-    LCD_Command(0x01u);
+    LCD_Command(
+        0x01u);
 
     Delay_ms(3u);
 }
@@ -1121,7 +1333,8 @@ static void LCD_SetCursor(
 
     if (row == 0u)
     {
-        address = column;
+        address =
+            column;
     }
     else
     {
@@ -1135,7 +1348,8 @@ static void LCD_SetCursor(
                   address));
 }
 
-static void LCD_Print(const char *str)
+static void LCD_Print(
+    const char *str)
 {
     while (*str != '\0')
     {
@@ -1146,7 +1360,8 @@ static void LCD_Print(const char *str)
     }
 }
 
-static void LCD_PrintInt(int16_t value)
+static void LCD_PrintInt(
+    int16_t value)
 {
     char buffer[8];
 
@@ -1154,13 +1369,15 @@ static void LCD_PrintInt(int16_t value)
 
     int32_t number;
 
-    number = value;
+    number =
+        value;
 
     if (number < 0)
     {
         LCD_Data('-');
 
-        number = -number;
+        number =
+            -number;
     }
 
     if (number == 0)
@@ -1172,13 +1389,12 @@ static void LCD_PrintInt(int16_t value)
 
     while (number > 0)
     {
-        buffer[index] =
+        buffer[index++] =
             (char)('0' +
                    (number % 10));
 
-        index++;
-
-        number /= 10;
+        number /=
+            10;
     }
 
     while (index > 0u)
@@ -1192,19 +1408,13 @@ static void LCD_PrintInt(int16_t value)
 }
 
 /* =========================================================
- * MPU6050
- *
- * I2C2
- * PB10 / PB11
+ * MPU6050 INIT
  * ========================================================= */
 
 static uint8_t MPU6050_Init(void)
 {
     uint8_t who;
 
-    /*
-     * WHO_AM_I
-     */
     who =
         I2C_ReadRegister(
             I2C2,
@@ -1220,19 +1430,13 @@ static uint8_t MPU6050_Init(void)
     UART1_SendString(
         "\r\n");
 
-    /*
-     * MPU6050 expected:
-     * WHO_AM_I = 0x68
-     */
     if (who != 0x68u)
     {
         return 0u;
     }
 
     /*
-     * Wake MPU6050.
-     *
-     * Default is sleep mode.
+     * Wake MPU6050
      */
     if (I2C_WriteRegister(
             I2C2,
@@ -1243,13 +1447,14 @@ static uint8_t MPU6050_Init(void)
         return 0u;
     }
 
-    Delay_ms(100u);
+    Delay_ms(
+        100u);
 
     return 1u;
 }
 
 /* =========================================================
- * MPU6050 READ ACCEL X
+ * READ ACCEL X
  * ========================================================= */
 
 static int16_t MPU6050_ReadAX(void)
@@ -1262,6 +1467,11 @@ static int16_t MPU6050_ReadAX(void)
             I2C2,
             MPU6050_ADDR,
             MPU_ACCEL_X_H);
+
+    /*
+     * STOP có thể xảy ra ngay đây
+     * nhờ USART IRQ.
+     */
 
     low =
         I2C_ReadRegister(
@@ -1283,14 +1493,20 @@ static void Show_AX(void)
 {
     int16_t ax;
 
-    /*
-     * Read MPU
-     */
     ax =
         MPU6050_ReadAX();
 
+    /*
+     * Nếu STOP vừa tới trong lúc
+     * đọc I2C -> thoát ngay.
+     */
+    if (g_ax_stream == 0u)
+    {
+        return;
+    }
+
     /* =====================================================
-     * UART OUTPUT
+     * UART
      * ===================================================== */
 
     UART1_SendString(
@@ -1302,19 +1518,34 @@ static void Show_AX(void)
     UART1_SendString(
         "\r\n");
 
+    /*
+     * STOP có thể đến
+     * trong lúc UART đang TX.
+     */
+    if (g_ax_stream == 0u)
+    {
+        return;
+    }
+
     /* =====================================================
-     * LCD OUTPUT
+     * LCD
      * ===================================================== */
 
     LCD_SetCursor(
         1u,
         0u);
 
-    /*
-     * Clear second line.
-     */
     LCD_Print(
         "                ");
+
+    /*
+     * STOP có thể đến
+     * trong lúc LCD update.
+     */
+    if (g_ax_stream == 0u)
+    {
+        return;
+    }
 
     LCD_SetCursor(
         1u,
@@ -1328,7 +1559,7 @@ static void Show_AX(void)
 }
 
 /* =========================================================
- * COMMAND PROCESSOR
+ * PROCESS COMMAND
  * ========================================================= */
 
 static void Process_Command(
@@ -1345,25 +1576,25 @@ static void Process_Command(
             "HELP") == 0)
     {
         UART1_SendString(
-            "\r\nAVAILABLE COMMANDS\r\n");
+            "\r\nCOMMANDS\r\n");
 
         UART1_SendString(
             "HELP       - Show commands\r\n");
 
         UART1_SendString(
-            "SCAN       - Scan I2C1 + I2C2\r\n");
+            "SCAN       - Scan I2C buses\r\n");
 
         UART1_SendString(
-            "MPU        - Read WHO_AM_I\r\n");
+            "MPU        - MPU WHO_AM_I\r\n");
 
         UART1_SendString(
-            "AX         - Start AX continuous mode\r\n");
+            "AX         - Start AX stream\r\n");
 
         UART1_SendString(
-            "STOP       - Stop AX continuous mode\r\n");
+            "STOP       - Stop AX immediately\r\n");
 
         UART1_SendString(
-            "LCD HELLO  - Show Hello World\r\n");
+            "LCD HELLO  - LCD Hello World\r\n");
     }
 
     /* =====================================================
@@ -1421,37 +1652,56 @@ static void Process_Command(
     /* =====================================================
      * AX
      *
-     * START STREAM
+     * START CONTINUOUS MODE
      * ===================================================== */
 
     else if (strcmp(
                  command,
                  "AX") == 0)
     {
-        g_ax_stream = 1u;
+        /*
+         * Reset STOP detector
+         */
+        g_stop_state =
+            0u;
+
+        g_stop_event =
+            0u;
+
+        /*
+         * Start AX
+         */
+        g_ax_stream =
+            1u;
 
         UART1_SendString(
-            "AX continuous mode START\r\n");
+            "\r\nAX STREAM START\r\n");
 
         UART1_SendString(
-            "Update period = 500 ms\r\n");
+            "Update: 500 ms\r\n");
 
         UART1_SendString(
-            "Type STOP to stop\r\n");
+            "Send STOP to stop\r\n");
     }
 
     /* =====================================================
      * STOP
+     *
+     * Backup command.
+     *
+     * Normal STOP thực tế đã được
+     * bắt ngay trong USART IRQ.
      * ===================================================== */
 
     else if (strcmp(
                  command,
                  "STOP") == 0)
     {
-        g_ax_stream = 0u;
+        g_ax_stream =
+            0u;
 
         UART1_SendString(
-            "AX continuous mode STOP\r\n");
+            "AX STREAM STOP\r\n");
     }
 
     /* =====================================================
@@ -1519,13 +1769,12 @@ int main(void)
     SystemCoreClockUpdate();
 
     /* =====================================================
-     * SYSTICK
-     *
-     * 1 ms tick
+     * SYSTICK 1 ms
      * ===================================================== */
 
     if (SysTick_Config(
-            SystemCoreClock / 1000u) != 0u)
+            SystemCoreClock /
+            1000u) != 0u)
     {
         while (1)
         {
@@ -1545,7 +1794,7 @@ int main(void)
         "================================\r\n");
 
     UART1_SendString(
-        " STM32F103 I2C + MPU + UART\r\n");
+        " STM32F103 LCD + MPU + UART IRQ\r\n");
 
     UART1_SendString(
         "================================\r\n");
@@ -1554,7 +1803,7 @@ int main(void)
         "UART1 PA9 TX / PA10 RX\r\n");
 
     UART1_SendString(
-        "Baudrate: 115200\r\n");
+        "115200 baud\r\n");
 
     /* =====================================================
      * I2C
@@ -1562,18 +1811,12 @@ int main(void)
 
     I2C_GPIO_Init();
 
-    /*
-     * LCD
-     */
     I2C1_Init();
 
-    /*
-     * MPU6050
-     */
     I2C2_Init();
 
     /* =====================================================
-     * INITIAL I2C SCAN
+     * INITIAL SCAN
      * ===================================================== */
 
     I2C_Scan(
@@ -1585,7 +1828,7 @@ int main(void)
         "I2C2 PB10/PB11");
 
     /* =====================================================
-     * LCD INIT
+     * LCD
      * ===================================================== */
 
     LCD_Init();
@@ -1597,7 +1840,7 @@ int main(void)
         0u);
 
     LCD_Print(
-        "STM32 I2C UART");
+        "STM32 UART IRQ");
 
     LCD_SetCursor(
         1u,
@@ -1607,7 +1850,7 @@ int main(void)
         "Starting...");
 
     /* =====================================================
-     * MPU6050 INIT
+     * MPU6050
      * ===================================================== */
 
     mpu_ok =
@@ -1630,7 +1873,7 @@ int main(void)
             0u);
 
         LCD_Print(
-            "Type AX UART    ");
+            "Send AX         ");
     }
     else
     {
@@ -1653,14 +1896,14 @@ int main(void)
     }
 
     /* =====================================================
-     * UART COMMAND MODE
+     * COMMAND MODE
      * ===================================================== */
 
     UART1_SendString(
-        "\r\nUART COMMAND MODE\r\n");
+        "\r\nCOMMAND MODE\r\n");
 
     UART1_SendString(
-        "Type HELP to show commands\r\n");
+        "Type HELP\r\n");
 
     UART1_SendString(
         "> ");
@@ -1672,23 +1915,72 @@ int main(void)
     while (1)
     {
         /* =================================================
-         * UART RECEIVE
+         * STOP EVENT
          *
-         * NON-BLOCKING
-         *
-         * Không dùng UART1_GetChar() blocking nữa.
+         * Event này được tạo bởi USART1 IRQ.
          * ================================================= */
 
-        if ((USART1->SR & USART_SR_RXNE) != 0u)
+        if (g_stop_event != 0u)
         {
-            c =
-                (char)(USART1->DR &
-                       0xFFu);
+            /*
+             * Clear event
+             */
+            g_stop_event =
+                0u;
 
-            /* ---------------------------------------------
+            /*
+             * AX chắc chắn OFF
+             */
+            g_ax_stream =
+                0u;
+
+            /*
+             * Bỏ chữ STOP còn dư
+             * trong RX buffer.
+             */
+            uart_rx_tail =
+                uart_rx_head;
+
+            /*
+             * Reset command
+             */
+            index =
+                0u;
+
+            /*
+             * Reset STOP detector
+             */
+            g_stop_state =
+                0u;
+
+            UART1_SendString(
+                "\r\n");
+
+            UART1_SendString(
+                "============================\r\n");
+
+            UART1_SendString(
+                " AX STOPPED BY UART INTERRUPT\r\n");
+
+            UART1_SendString(
+                "============================\r\n");
+
+            UART1_SendString(
+                "> ");
+        }
+
+        /* =================================================
+         * UART COMMAND RECEIVE
+         *
+         * NON BLOCKING
+         * ================================================= */
+
+        if (UART1_ReadChar(
+                &c) != 0u)
+        {
+            /*
              * lowercase -> uppercase
-             * --------------------------------------------- */
-
+             */
             if ((c >= 'a') &&
                 (c <= 'z'))
             {
@@ -1698,9 +1990,9 @@ int main(void)
                            'A');
             }
 
-            /* ---------------------------------------------
+            /* =============================================
              * ENTER
-             * --------------------------------------------- */
+             * ============================================= */
 
             if ((c == '\r') ||
                 (c == '\n'))
@@ -1716,16 +2008,17 @@ int main(void)
                     Process_Command(
                         command);
 
-                    index = 0u;
+                    index =
+                        0u;
 
                     UART1_SendString(
                         "\r\n> ");
                 }
             }
 
-            /* ---------------------------------------------
+            /* =============================================
              * BACKSPACE
-             * --------------------------------------------- */
+             * ============================================= */
 
             else if (
                 (c == '\b') ||
@@ -1740,23 +2033,18 @@ int main(void)
                 }
             }
 
-            /* ---------------------------------------------
+            /* =============================================
              * NORMAL CHARACTER
-             * --------------------------------------------- */
+             * ============================================= */
 
             else
             {
                 if (index <
                     (sizeof(command) - 1u))
                 {
-                    command[index] =
+                    command[index++] =
                         c;
 
-                    index++;
-
-                    /*
-                     * Echo
-                     */
                     UART1_SendChar(
                         c);
                 }
@@ -1764,9 +2052,7 @@ int main(void)
         }
 
         /* =================================================
-         * AX CONTINUOUS MODE
-         *
-         * Non-blocking timing
+         * AX STREAM TASK
          * ================================================= */
 
         if (g_ax_stream != 0u)
@@ -1779,9 +2065,12 @@ int main(void)
                     g_ms;
 
                 /*
-                 * Read MPU + update UART + LCD
+                 * Kiểm tra flag trước khi chạy.
                  */
-                Show_AX();
+                if (g_ax_stream != 0u)
+                {
+                    Show_AX();
+                }
             }
         }
     }
