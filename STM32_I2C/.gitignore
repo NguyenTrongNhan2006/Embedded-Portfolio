@@ -1,0 +1,52 @@
+# Build directories
+build/
+Debug/
+Release/
+obj/
+bin/
+
+# IDE files
+.vscode/
+.idea/
+*.ioc
+*.eww
+*.ewp
+*.ewd
+*.uvprojx
+*.uvoptx
+*.uvguix
+
+# STM32CubeMX generated files
+Drivers/
+Middlewares/
+*.ioc.bak
+
+# Compiler output
+*.o
+*.obj
+*.elf
+*.hex
+*.bin
+*.map
+*.list
+*.su
+*.d
+
+# Linker files
+*.ld.bak
+
+# System files
+.DS_Store
+Thumbs.db
+*.tmp
+*.temp
+*.log
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# GDB files
+*.gdb
